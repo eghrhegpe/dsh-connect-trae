@@ -23,8 +23,8 @@
 ### 新增
 
 - **文生图接进会话：`trae_draw_image`**（`feat(tools)`）。
-  - 用登录账号画一张图，返回 Trae 的**图片对象 key**（形如 `tos-cn-i-…/cn/<uid>/gen_image/…`，
-    图在 Trae 客户端的历史里能看到；字节插件拿不到，见下）。默认关闭、**按面板单独开**：
+  - 用登录账号画一张图，工具把**图片字节一起取回来**、写进会话目录的 `trae-images/`，并在结果里给
+    相对路径 `path`（渲染层据此把图显示出来）。默认关闭、**按面板单独开**：
     卡片模型栏勾上「允许模型自主生图」（`drawImageEnabled`）该面板才注册这个工具，
     取消勾选立即撤下。
   - **协议是实测出来的，不是从二进制里猜的**：`POST /api/ide/v1/tool_text_to_image`
@@ -36,18 +36,29 @@
     预设 `2k`/`3k`/`4k` 可用，缺省 `1920x1920`。
   - **计费口径写进工具文案**：实测 `1920x1920` 一张约 **8.8 积分**（国内版价），上游不回传
     扣费数字。失败后加 **30 秒冷却**（按张计费，不过冷却的重试等于再买一张）。
-  - **不取图，只回 key**：同路径的 GET 不是取图，**是又一次生成**。决定性探针（CN 个人版）：
-    POST 拿到 `…/1792954795741_44f94116_jpeg_1920x1920` 之后，用同一 `(prompt, size)` 带
-    全套网关头 + `x-ide-sign` 打 GET，回来的是**另一个** uri
+  - **那条「取图」GET 是又一次生成，已停用**：同路径带 `?prompt=&image_size=` 的 GET 不是取图。
+    决定性探针（CN 个人版）：POST 拿到 `…/1792954795741_44f94116_jpeg_1920x1920` 之后，用同一
+    `(prompt, size)` 带全套网关头 + `x-ide-sign` 打 GET，回来的是**另一个** uri
     （`…/1792954810505_b107ac11_jpeg_1920x1920`），耗时 27 秒、**一个像素都没有**——等于又画
     一张、又扣一次（两次共约 17.6）。非法尺寸探针（`100x100`）同样印证：报错直接来自 Ark 的
-    `[callArkImageGeneration]`。所以发版代码**不再发这条 GET**：`generate` 只发一次 POST，
-    返回 `{url, credit?}`，渲染层把 key 显示成**行内代码**并注明「不能直接打开」，绝不拼进
-    `![](...)`（key 不是路径，拼进去只会得到以当前目录为基准的碎图标）。要真正把 uri 变成
-    字节，需要另一条通道（iCube material 的 `get_url` + `x-icube-token`，基址来自运行时
-    boot config），目前**没有打通**，代码里也不留假装能取的入口。
-    两例 `tests/image-tool-render.spec.ts` 与两例 `tests/image-tool-download.spec.ts`
-    （现已改名口径）用 stub fetch 断言**每次生成只发一次请求**。
+    `[callArkImageGeneration]`。发版代码**不再发这条 GET**。
+  - **真正的取图是两步、零额外计费**（同日实测）：`POST /api/ide/v1/get_resource_url`，body 必须
+    正是 `{"uri_list":["<tos key>"]}`——`{uri}`/`{path}`/`{resource_uri}`/`{uris:[…]}`/
+    `{resources:[…]}`/`{scene:'report',uri}` 以及 GET `?uri=` 统统只回 200 + 空 `url_map`
+    （不报错，也不给地址）；应答是 `{"url_map":{"<key>":"<byteimg 签名 URL>"}}`，再直接 GET 那个
+    签名地址（**不带任何 Trae 头**，签名在 query 里、带 `x-expires`）即得字节——实测
+    `image/jpeg`、1,155,578 字节、头 `ffd8ffe0`。死路已排除：`get_resource_upload_token` 给的
+    TOS STS 凭证读桶一律 `InvalidAccessKeyId`/`NoSuchBucket`。
+  - **落盘与显示**：`generate` 返回 `{url, path, credit?}`，图片写在 `<session cwd>/trae-images/`
+    下（时间戳 + 随机后缀，png/webp/jpeg 各用各的后缀）；`render` 输出
+    `![Trae 文生图](trae-images/…)`——DSH 的聊天按 session cwd 解析相对路径，再过宿主的
+    `api/file` 鉴权路由取字节，所以图直接显示。只有字节真的没拿到时（`IMAGE_UNAVAILABLE`：
+    图已生成、积分已扣）才退化成「只有对象 key」的行内代码，且该失败码也在冷却集合里。
+  - 测试：`tests/image-tool-render.spec.ts` 9 例（字节落盘、png 后缀、credit 回显、hint、
+    无 path 时回退 key、写盘失败即 `IMAGE_UNAVAILABLE`、三种冷却）与
+    `tests/image-tool-download.spec.ts` 3 例（stub fetch 断言恰好三跳、`uri_list` 请求体、
+    CDN 请求不带网关头、空 `url_map` 即失败），钉住「一次生成 = 一次 POST + 一次解析 +
+    一次 CDN GET，且不再出现 `?image_size=` 的 GET」。
   - **只有国内版面板提供**（`DRAW_IMAGE_PANELS = ['cn']`，见 `src/status-paths.ts`）。
     企业版走租户网关、国际版按另一套套餐计费，两者的生图行为都**没有测过**：企业版原先
     就因为这一点被拒绝，国际版没有理由凭「面板是消费者版」放行——而且工具文案里的
@@ -69,4 +80,5 @@
 ### 文档
 
 - `README.md` / `README.en.md` 新增「文生图」一节与功能列表条目：开关语义（含只有国内版
-  提供）、实测协议表、计费，以及为什么那条「取图」GET **是又一次生成**、插件只回 key。
+  提供）、实测协议表、计费、取图两步（`get_resource_url` → 签名地址 → 字节落盘 → 相对路径
+  显示），以及为什么那条「取图」GET **是又一次生成**。
